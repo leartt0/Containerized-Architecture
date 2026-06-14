@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: adria-production
+  labels:
+    environment: production
+    app: adria-reserve

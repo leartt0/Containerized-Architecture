@@ -1,0 +1,2 @@
+# Shared Kubernetes resources — substitute NAMESPACE and adjust replicas/resources per environment.
+# See k8s/dev, k8s/staging, k8s/production for complete manifests.

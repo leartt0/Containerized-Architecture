@@ -1,0 +1,329 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: adria-secrets
+  namespace: adria-dev
+type: Opaque
+stringData:
+  DB_PASSWORD: adria_dev_k8s_password
+  JWT_SECRET: dev-jwt-secret-change-in-production
+  JWT_REFRESH_SECRET: dev-refresh-secret-change-in-production
+  BROS_TRAVEL_USERNAME: demo
+  BROS_TRAVEL_PASSWORD: demo
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adria-backend-config
+  namespace: adria-dev
+data:
+  NODE_ENV: development
+  PORT: "3001"
+  LOG_LEVEL: debug
+  DB_HOST: adria-postgres
+  DB_PORT: "5432"
+  DB_NAME: adria_reserve
+  DB_USER: adria_user
+  FRONTEND_URL: http://adria-frontend
+  BROS_TRAVEL_API_URL: https://services.bros-travel.com
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adria-postgres-config
+  namespace: adria-dev
+data:
+  POSTGRES_DB: adria_reserve
+  POSTGRES_USER: adria_user
+
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: adria-dev-quota
+  namespace: adria-dev
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 2Gi
+    limits.cpu: "1"
+    limits.memory: 2Gi
+    pods: "10"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: adria-backend-logs-pvc
+  namespace: adria-dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Mi
+  storageClassName: standard
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: adria-dev-limits
+  namespace: adria-dev
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+
+---
+# Standalone Pod — demonstrates direct Pod usage (health probe sidecar pattern)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: adria-health-probe
+  namespace: adria-dev
+  labels:
+    app: adria-reserve
+    component: health-probe
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: probe
+      image: curlimages/curl:8.5.0
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 50m
+          memory: 64Mi
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: adria-postgres
+  namespace: adria-dev
+spec:
+  serviceName: adria-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: adria-postgres
+  template:
+    metadata:
+      labels:
+        app: adria-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:14-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          envFrom:
+            - configMapRef:
+                name: adria-postgres-config
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: adria-secrets
+                  key: DB_PASSWORD
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "adria_user", "-d", "adria_reserve"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: adria-postgres
+  namespace: adria-dev
+spec:
+  clusterIP: None
+  selector:
+    app: adria-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adria-backend
+  namespace: adria-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: adria-backend
+  template:
+    metadata:
+      labels:
+        app: adria-backend
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z adria-postgres 5432; do sleep 2; done"]
+      containers:
+        - name: backend
+          image: leartt0/adria-reserve-backend:1.0.0-dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3001
+          envFrom:
+            - configMapRef:
+                name: adria-backend-config
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: adria-secrets
+                  key: DB_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: adria-secrets
+                  key: JWT_SECRET
+            - name: JWT_REFRESH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: adria-secrets
+                  key: JWT_REFRESH_SECRET
+            - name: BROS_TRAVEL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: adria-secrets
+                  key: BROS_TRAVEL_USERNAME
+            - name: BROS_TRAVEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: adria-secrets
+                  key: BROS_TRAVEL_PASSWORD
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 400m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 40
+            periodSeconds: 20
+      volumes:
+        - name: logs
+          persistentVolumeClaim:
+            claimName: adria-backend-logs-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: adria-backend
+  namespace: adria-dev
+spec:
+  type: ClusterIP
+  selector:
+    app: adria-backend
+  ports:
+    - port: 3001
+      targetPort: 3001
+      name: http
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adria-frontend
+  namespace: adria-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: adria-frontend
+  template:
+    metadata:
+      labels:
+        app: adria-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: leartt0/adria-reserve-frontend:1.0.0-dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: adria-frontend
+  namespace: adria-dev
+spec:
+  type: NodePort
+  selector:
+    app: adria-frontend
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30080
+      name: http
